@@ -1,0 +1,5 @@
+# Normalise line endings so shell scripts and YAML work on Linux CI runners
+# regardless of the contributor's OS.
+* text=auto eol=lf
+*.png binary
+*.ico binary
