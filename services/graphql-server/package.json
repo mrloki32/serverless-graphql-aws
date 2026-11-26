@@ -1,0 +1,21 @@
+{
+  "name": "@gqlapp/graphql-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Private Apollo GraphQL server (ECS Fargate, private subnets, internal ALB) that owns write operations against RDS",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.js --sourcemap --external:pg-native --legal-comments=none",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@apollo/server": "^5.0.0",
+    "@gqlapp/core": "*",
+    "graphql": "^16.9.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}

@@ -1,0 +1,37 @@
+# Local development only: PostgreSQL + the private GraphQL server.
+# In AWS these run as RDS (private subnets) and ECS Fargate (private subnets).
+# The passwords below are throwaway values for a disposable local container;
+# real credentials only ever live in AWS Secrets Manager.
+services:
+  postgres:
+    image: postgres:17-alpine # same major version as RDS
+    environment:
+      POSTGRES_USER: dbadmin
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbadmin -d appdb"]
+      interval: 5s
+      retries: 10
+
+  graphql-server:
+    build:
+      context: .
+      dockerfile: services/graphql-server/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      NODE_ENV: development
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: appdb
+      DB_USERNAME: app_rw
+      DB_PASSWORD: app_rw_localdev
+      DB_SSL: "false"
+      INTERNAL_API_TOKEN: local-internal-token
+    ports:
+      - "4000:4000"

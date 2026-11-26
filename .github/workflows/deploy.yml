@@ -1,0 +1,43 @@
+# Deployment pipeline: main -> CI -> staging (auto) -> production (manual approval).
+#
+# Production approval is enforced by the GitHub "production" environment
+# (Settings -> Environments -> production -> Required reviewers), and the AWS
+# role can only be assumed by jobs running in the staging/production environments.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deployment at a time, never cancelled half-way (shared with rollback.yml).
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  staging:
+    needs: ci
+    uses: ./.github/workflows/deploy-stage.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      stage: staging
+      environment: staging
+
+  production:
+    needs: staging
+    uses: ./.github/workflows/deploy-stage.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      stage: prod
+      environment: production

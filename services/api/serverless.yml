@@ -1,0 +1,693 @@
+# Public GraphQL API: AWS AppSync + TypeScript Lambda resolvers + Cognito.
+#
+# Depends on (deployed first by infra/scripts/deploy-stacks.sh):
+#   gqlapp-bootstrap            deployment bucket, CloudFormation execution role
+#   gqlapp-<stage>-alerts       SNS alarm topic
+#   gqlapp-<stage>-network      VPC, private subnets, security groups
+#   gqlapp-<stage>-database     RDS endpoints + Secrets Manager ARNs
+#   gqlapp-<stage>-ecs          private GraphQL server URL + internal token secret ARN
+#   gqlapp-<stage>-frontend     site URL (Cognito callback URLs)
+#
+# Deploy:   npx serverless deploy --stage staging
+# Rollback: npx serverless rollback --stage staging --timestamp <ts>   (see docs/monitoring-rollback.md)
+
+service: gqlapp-api
+frameworkVersion: '3'
+configValidationMode: warn
+
+plugins:
+  - serverless-esbuild
+  - serverless-plugin-canary-deployments
+
+package:
+  individually: true # one small zip per function -> faster cold starts
+
+params:
+  default:
+    reservedConcurrency: 25
+    # CodeDeploy traffic shifting for the `Live` alias (see deploymentSettings).
+    deploymentType: AllAtOnce
+    logRetentionDays: 30
+  prod:
+    reservedConcurrency: 200
+    deploymentType: Canary10Percent5Minutes
+    logRetentionDays: 90
+
+custom:
+  app: gqlapp
+  prefix: ${self:custom.app}-${sls:stage}
+  stacks:
+    alerts: ${self:custom.prefix}-alerts
+    network: ${self:custom.prefix}-network
+    database: ${self:custom.prefix}-database
+    ecs: ${self:custom.prefix}-ecs
+    frontend: ${self:custom.prefix}-frontend
+  alarmTopicArn: ${cf:${self:custom.stacks.alerts}.AlarmTopicArn}
+  siteUrl: ${cf:${self:custom.stacks.frontend}.SiteUrl}
+  migrateFunctionName: CodeDeployHook_${self:custom.prefix}-migrate
+  # Global settings for serverless-plugin-canary-deployments. Supplying our own
+  # role stops the plugin from creating its default one, which attaches
+  # AWSLambda_FullAccess.
+  deploymentSettings:
+    codeDeployRole: !GetAtt CodeDeployServiceRoleLimited.Arn
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    target: node22
+    platform: node
+    # pg's optional native binding is never used.
+    exclude:
+      - pg-native
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  architecture: arm64 # Graviton: ~20% cheaper per GB-second
+  stage: ${opt:stage, 'staging'}
+  region: ${opt:region, env:AWS_REGION, 'us-east-1'}
+  memorySize: 512
+  timeout: 10
+  logRetentionInDays: ${param:logRetentionDays}
+  versionFunctions: true # previous versions are kept -> instant alias rollback
+  tracing:
+    lambda: true
+  deploymentBucket:
+    name: ${cf:gqlapp-bootstrap.DeploymentBucketName}
+    serverSideEncryption: AES256
+  iam:
+    # CloudFormation performs the deployment with this role; the CI role itself
+    # can only pass it (see infra/bootstrap.yml).
+    deploymentRole: ${cf:gqlapp-bootstrap.CfnExecutionRoleArn}
+    role:
+      # Shared by query/mutation/subscription. Least privilege: read the read-only
+      # DB secret and the internal API token, nothing else.
+      statements:
+        - Effect: Allow
+          Action: secretsmanager:GetSecretValue
+          Resource:
+            - ${cf:${self:custom.stacks.database}.AppReadOnlySecretArn}
+            - ${cf:${self:custom.stacks.ecs}.InternalApiTokenSecretArn}
+  vpc:
+    securityGroupIds:
+      - ${cf:${self:custom.stacks.network}.LambdaSecurityGroupId}
+    subnetIds:
+      - ${cf:${self:custom.stacks.network}.PrivateSubnet1Id}
+      - ${cf:${self:custom.stacks.network}.PrivateSubnet2Id}
+  environment:
+    STAGE: ${sls:stage}
+    LOG_LEVEL: info
+    GIT_SHA: ${env:GIT_SHA, 'local'}
+    NODE_OPTIONS: --enable-source-maps
+    # Node 20+ Lambda runtimes don't load the RDS CA by default.
+    NODE_EXTRA_CA_CERTS: /var/runtime/ca-cert.pem
+    DB_HOST: ${cf:${self:custom.stacks.database}.WriteEndpoint}
+    DB_READ_HOST: ${cf:${self:custom.stacks.database}.ReadEndpoint}
+    DB_PORT: ${cf:${self:custom.stacks.database}.Port}
+    DB_NAME: ${cf:${self:custom.stacks.database}.DatabaseName}
+    DB_SSL: 'true'
+    DB_RO_SECRET_ARN: ${cf:${self:custom.stacks.database}.AppReadOnlySecretArn}
+    INTERNAL_API_URL: ${cf:${self:custom.stacks.ecs}.InternalApiUrl}
+    INTERNAL_API_TOKEN_SECRET_ARN: ${cf:${self:custom.stacks.ecs}.InternalApiTokenSecretArn}
+  stackTags:
+    app: ${self:custom.app}
+    stage: ${sls:stage}
+    managed-by: serverless
+
+functions:
+  query:
+    handler: src/handlers/query.handler
+    description: AppSync Query.* resolver (RDS read endpoint + private GraphQL server)
+    reservedConcurrency: ${param:reservedConcurrency}
+    deploymentSettings:
+      type: ${param:deploymentType}
+      alias: Live
+      preTrafficHook: migrate
+      alarms:
+        - QueryErrorsAlarm
+
+  mutation:
+    handler: src/handlers/mutation.handler
+    description: AppSync Mutation.* resolver (writes via private GraphQL server)
+    reservedConcurrency: ${param:reservedConcurrency}
+    deploymentSettings:
+      type: ${param:deploymentType}
+      alias: Live
+      preTrafficHook: migrate
+      alarms:
+        - MutationErrorsAlarm
+
+  subscription:
+    handler: src/handlers/subscription.handler
+    description: AppSync Subscription.* resolver (authorizes subscriptions)
+    memorySize: 256
+    reservedConcurrency: ${param:reservedConcurrency}
+    deploymentSettings:
+      type: ${param:deploymentType}
+      alias: Live
+      preTrafficHook: migrate
+      alarms:
+        - SubscriptionErrorsAlarm
+
+  migrate:
+    # The CodeDeployHook_ prefix lets CodeDeploy's managed Lambda policy invoke it.
+    name: ${self:custom.migrateFunctionName}
+    handler: src/handlers/migrate.handler
+    description: DB migrations + app role provisioning (CodeDeploy BeforeAllowTraffic hook)
+    timeout: 120
+    reservedConcurrency: 3
+    role: MigrateRole
+    environment:
+      DB_INSTANCE_HOST: ${cf:${self:custom.stacks.database}.InstanceEndpoint}
+      DB_MASTER_SECRET_ARN: ${cf:${self:custom.stacks.database}.MasterUserSecretArn}
+      DB_RW_SECRET_ARN: ${cf:${self:custom.stacks.database}.AppReadWriteSecretArn}
+
+resources:
+  Parameters:
+    Stage:
+      Type: String
+      Default: ${sls:stage}
+      AllowedValues: [staging, prod]
+  Conditions:
+    IsProd: !Equals [!Ref Stage, prod]
+
+  Resources:
+    # ------------------------------------------------------------------ Cognito
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: ${self:custom.prefix}-users
+        UsernameAttributes: [email]
+        AutoVerifiedAttributes: [email]
+        MfaConfiguration: OPTIONAL
+        EnabledMfas: [SOFTWARE_TOKEN_MFA]
+        DeletionProtection: !If [IsProd, ACTIVE, INACTIVE]
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 12
+            RequireLowercase: true
+            RequireUppercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+            TemporaryPasswordValidityDays: 3
+
+    UserPoolDomain:
+      Type: AWS::Cognito::UserPoolDomain
+      Properties:
+        UserPoolId: !Ref UserPool
+        Domain: ${self:custom.prefix}-${aws:accountId}
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: ${self:custom.prefix}-web
+        UserPoolId: !Ref UserPool
+        GenerateSecret: false # public SPA client: authorization code + PKCE
+        AllowedOAuthFlowsUserPoolClient: true
+        AllowedOAuthFlows: [code]
+        AllowedOAuthScopes: [openid, email, profile]
+        SupportedIdentityProviders: [COGNITO]
+        CallbackURLs: !If
+          - IsProd
+          - ['${self:custom.siteUrl}/']
+          - ['${self:custom.siteUrl}/', 'http://localhost:5173/']
+        LogoutURLs: !If
+          - IsProd
+          - ['${self:custom.siteUrl}/']
+          - ['${self:custom.siteUrl}/', 'http://localhost:5173/']
+        ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH]
+        PreventUserExistenceErrors: ENABLED
+        EnableTokenRevocation: true
+        AccessTokenValidity: 60
+        IdTokenValidity: 60
+        RefreshTokenValidity: 30
+        TokenValidityUnits:
+          AccessToken: minutes
+          IdToken: minutes
+          RefreshToken: days
+
+    # ------------------------------------------------------------------ AppSync
+    GraphQlApi:
+      Type: AWS::AppSync::GraphQLApi
+      Properties:
+        Name: ${self:custom.prefix}-api
+        AuthenticationType: AMAZON_COGNITO_USER_POOLS
+        UserPoolConfig:
+          UserPoolId: !Ref UserPool
+          AwsRegion: !Ref AWS::Region
+          DefaultAction: ALLOW
+        AdditionalAuthenticationProviders:
+          - AuthenticationType: AWS_IAM # CI smoke tests (Query.health only)
+        XrayEnabled: true
+        QueryDepthLimit: 10
+        IntrospectionConfig: !If [IsProd, DISABLED, ENABLED]
+        LogConfig:
+          CloudWatchLogsRoleArn: !GetAtt AppSyncLogsRole.Arn
+          FieldLogLevel: ERROR
+          ExcludeVerboseContent: true
+
+    GraphQlSchema:
+      Type: AWS::AppSync::GraphQLSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        Definition: ${file(./config/files.js):schema}
+
+    AppSyncLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: !Join ['', ['/aws/appsync/apis/', !GetAtt GraphQlApi.ApiId]]
+        RetentionInDays: ${param:logRetentionDays}
+
+    AppSyncLogsRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: appsync.amazonaws.com }
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: appsync-logs
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                  Resource: !Join ['', ['arn:aws:logs:', !Ref AWS::Region, ':', !Ref AWS::AccountId, ':log-group:/aws/appsync/apis/*']]
+
+    # AppSync may only invoke the three resolver functions (any version/alias).
+    AppSyncInvokeRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: appsync.amazonaws.com }
+              Action: sts:AssumeRole
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+        Policies:
+          - PolicyName: invoke-resolvers
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource:
+                    - !GetAtt QueryLambdaFunction.Arn
+                    - !Join ['', [!GetAtt QueryLambdaFunction.Arn, ':*']]
+                    - !GetAtt MutationLambdaFunction.Arn
+                    - !Join ['', [!GetAtt MutationLambdaFunction.Arn, ':*']]
+                    - !GetAtt SubscriptionLambdaFunction.Arn
+                    - !Join ['', [!GetAtt SubscriptionLambdaFunction.Arn, ':*']]
+
+    # Data sources target the `Live` alias managed by CodeDeploy, so traffic
+    # shifting and automatic rollback apply to every GraphQL request.
+    QueryDataSource:
+      Type: AWS::AppSync::DataSource
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        Name: QueryLambda
+        Type: AWS_LAMBDA
+        ServiceRoleArn: !GetAtt AppSyncInvokeRole.Arn
+        LambdaConfig:
+          LambdaFunctionArn: !Join [':', [!GetAtt QueryLambdaFunction.Arn, Live]]
+
+    MutationDataSource:
+      Type: AWS::AppSync::DataSource
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        Name: MutationLambda
+        Type: AWS_LAMBDA
+        ServiceRoleArn: !GetAtt AppSyncInvokeRole.Arn
+        LambdaConfig:
+          LambdaFunctionArn: !Join [':', [!GetAtt MutationLambdaFunction.Arn, Live]]
+
+    SubscriptionDataSource:
+      Type: AWS::AppSync::DataSource
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        Name: SubscriptionLambda
+        Type: AWS_LAMBDA
+        ServiceRoleArn: !GetAtt AppSyncInvokeRole.Arn
+        LambdaConfig:
+          LambdaFunctionArn: !Join [':', [!GetAtt SubscriptionLambdaFunction.Arn, Live]]
+
+    QueryTasksResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Query
+        FieldName: tasks
+        Kind: UNIT
+        DataSourceName: !GetAtt QueryDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    QueryTaskResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Query
+        FieldName: task
+        Kind: UNIT
+        DataSourceName: !GetAtt QueryDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    QueryTaskStatsResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Query
+        FieldName: taskStats
+        Kind: UNIT
+        DataSourceName: !GetAtt QueryDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    QueryHealthResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Query
+        FieldName: health
+        Kind: UNIT
+        DataSourceName: !GetAtt QueryDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    MutationCreateTaskResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Mutation
+        FieldName: createTask
+        Kind: UNIT
+        DataSourceName: !GetAtt MutationDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    MutationUpdateTaskResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Mutation
+        FieldName: updateTask
+        Kind: UNIT
+        DataSourceName: !GetAtt MutationDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    MutationDeleteTaskResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Mutation
+        FieldName: deleteTask
+        Kind: UNIT
+        DataSourceName: !GetAtt MutationDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    SubscriptionOnTaskChangedResolver:
+      Type: AWS::AppSync::Resolver
+      DependsOn: GraphQlSchema
+      Properties:
+        ApiId: !GetAtt GraphQlApi.ApiId
+        TypeName: Subscription
+        FieldName: onTaskChanged
+        Kind: UNIT
+        DataSourceName: !GetAtt SubscriptionDataSource.Name
+        Runtime: { Name: APPSYNC_JS, RuntimeVersion: 1.0.0 }
+        Code: ${file(./config/files.js):lambdaResolver}
+
+    # --------------------------------------------------------- CodeDeploy role
+    # Least privilege for Lambda traffic shifting: update/read the alias, read
+    # the rollback alarms, invoke only CodeDeployHook_* functions.
+    CodeDeployServiceRoleLimited:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: codedeploy.amazonaws.com }
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambdaLimited
+
+    # ------------------------------------------------------------ migrate role
+    # Separate least-privilege role: only this function can read the master secret.
+    MigrateRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: lambda.amazonaws.com }
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        Policies:
+          - PolicyName: migrate
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    - ${cf:${self:custom.stacks.database}.MasterUserSecretArn}
+                    - ${cf:${self:custom.stacks.database}.AppReadWriteSecretArn}
+                    - ${cf:${self:custom.stacks.database}.AppReadOnlySecretArn}
+                - Effect: Allow
+                  Action: codedeploy:PutLifecycleEventHookExecutionStatus
+                  Resource: !Join ['', ['arn:aws:codedeploy:', !Ref AWS::Region, ':', !Ref AWS::AccountId, ':deploymentgroup:*']]
+
+    # ------------------------------------------------------------------ alarms
+    # *ErrorsAlarm are also CodeDeploy rollback triggers (deploymentSettings.alarms).
+    QueryErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-query-errors
+        AlarmDescription: Query resolver Lambda is failing (unexpected errors only; validation errors are not counted)
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref QueryLambdaFunction }]
+        Statistic: Sum
+        Period: 60
+        EvaluationPeriods: 5
+        DatapointsToAlarm: 2
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+        OKActions: ['${self:custom.alarmTopicArn}']
+
+    MutationErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-mutation-errors
+        AlarmDescription: Mutation resolver Lambda is failing
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref MutationLambdaFunction }]
+        Statistic: Sum
+        Period: 60
+        EvaluationPeriods: 5
+        DatapointsToAlarm: 2
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+        OKActions: ['${self:custom.alarmTopicArn}']
+
+    SubscriptionErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-subscription-errors
+        AlarmDescription: Subscription resolver Lambda is failing
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref SubscriptionLambdaFunction }]
+        Statistic: Sum
+        Period: 60
+        EvaluationPeriods: 5
+        DatapointsToAlarm: 2
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+        OKActions: ['${self:custom.alarmTopicArn}']
+
+    MigrateErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-migrate-errors
+        AlarmDescription: Database migration failed
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref MigrateLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+
+    QueryThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-query-throttles
+        AlarmDescription: Query Lambda is being throttled (reserved concurrency exhausted)
+        Namespace: AWS/Lambda
+        MetricName: Throttles
+        Dimensions: [{ Name: FunctionName, Value: !Ref QueryLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+
+    MutationThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-mutation-throttles
+        AlarmDescription: Mutation Lambda is being throttled (reserved concurrency exhausted)
+        Namespace: AWS/Lambda
+        MetricName: Throttles
+        Dimensions: [{ Name: FunctionName, Value: !Ref MutationLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+
+    QueryDurationAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-query-p95-duration
+        AlarmDescription: Query Lambda p95 duration above 2s
+        Namespace: AWS/Lambda
+        MetricName: Duration
+        Dimensions: [{ Name: FunctionName, Value: !Ref QueryLambdaFunction }]
+        ExtendedStatistic: p95
+        Period: 300
+        EvaluationPeriods: 3
+        Threshold: 2000
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+
+    MutationDurationAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-lambda-mutation-p95-duration
+        AlarmDescription: Mutation Lambda p95 duration above 3s
+        Namespace: AWS/Lambda
+        MetricName: Duration
+        Dimensions: [{ Name: FunctionName, Value: !Ref MutationLambdaFunction }]
+        ExtendedStatistic: p95
+        Period: 300
+        EvaluationPeriods: 3
+        Threshold: 3000
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+
+    AppSync5xxAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-appsync-5xx
+        AlarmDescription: AppSync is returning server errors
+        Namespace: AWS/AppSync
+        MetricName: 5XXError
+        Dimensions: [{ Name: GraphQLAPIId, Value: !GetAtt GraphQlApi.ApiId }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+        OKActions: ['${self:custom.alarmTopicArn}']
+
+    AppSyncLatencyAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-appsync-p95-latency
+        AlarmDescription: AppSync p95 latency above 2.5s
+        Namespace: AWS/AppSync
+        MetricName: Latency
+        Dimensions: [{ Name: GraphQLAPIId, Value: !GetAtt GraphQlApi.ApiId }]
+        ExtendedStatistic: p95
+        Period: 300
+        EvaluationPeriods: 3
+        Threshold: 2500
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${self:custom.alarmTopicArn}']
+
+    # ---------------------------------------------- Lambda auto scaling (prod)
+    # Provisioned concurrency on the `Live` alias of the hot read path, scaled by
+    # Application Auto Scaling on utilization. Everything else scales on demand
+    # (capped by reserved concurrency to protect RDS connection limits).
+    QueryProvisionedConcurrencyTarget:
+      Type: AWS::ApplicationAutoScaling::ScalableTarget
+      Condition: IsProd
+      DependsOn: QueryLambdaFunctionAliasLive
+      Properties:
+        ServiceNamespace: lambda
+        ScalableDimension: lambda:function:ProvisionedConcurrency
+        ResourceId: !Join ['', ['function:', !Ref QueryLambdaFunction, ':Live']]
+        MinCapacity: 2
+        MaxCapacity: 20
+
+    QueryProvisionedConcurrencyPolicy:
+      Type: AWS::ApplicationAutoScaling::ScalingPolicy
+      Condition: IsProd
+      Properties:
+        PolicyName: ${self:custom.prefix}-query-pc-utilization
+        PolicyType: TargetTrackingScaling
+        ScalingTargetId: !Ref QueryProvisionedConcurrencyTarget
+        TargetTrackingScalingPolicyConfiguration:
+          TargetValue: 0.7
+          PredefinedMetricSpecification:
+            PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
+
+  Outputs:
+    GraphQlApiId:
+      Value: !GetAtt GraphQlApi.ApiId
+    GraphQlApiUrl:
+      Value: !GetAtt GraphQlApi.GraphQLUrl
+    GraphQlRealtimeUrl:
+      Value: !GetAtt GraphQlApi.RealtimeUrl
+    UserPoolId:
+      Value: !Ref UserPool
+    UserPoolClientId:
+      Value: !Ref UserPoolClient
+    CognitoDomain:
+      Value: !Join ['', ['${self:custom.prefix}-${aws:accountId}', '.auth.', !Ref AWS::Region, '.amazoncognito.com']]
+    MigrateFunctionName:
+      Value: ${self:custom.migrateFunctionName}

@@ -1,0 +1,10 @@
+{
+  "stage": "local",
+  "region": "us-east-1",
+  "graphqlUrl": "https://xxxxxxxxxxxxxxxxxxxxxxxxxx.appsync-api.us-east-1.amazonaws.com/graphql",
+  "realtimeUrl": "wss://xxxxxxxxxxxxxxxxxxxxxxxxxx.appsync-realtime-api.us-east-1.amazonaws.com/graphql",
+  "userPoolId": "us-east-1_XXXXXXXXX",
+  "userPoolClientId": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "cognitoDomain": "gqlapp-staging-111111111111.auth.us-east-1.amazoncognito.com",
+  "version": "local"
+}

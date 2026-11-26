@@ -1,0 +1,158 @@
+# Deploys one stage end to end, verifies it, and rolls back automatically on failure.
+#
+# Variables (Settings -> Environments -> <env> -> Variables; none are secret):
+#   AWS_REGION            e.g. us-east-1
+#   AWS_DEPLOY_ROLE_ARN   output GitHubDeployRoleArn of the gqlapp-bootstrap stack
+#   ALERT_EMAIL           optional, subscribed to the alarm topic
+#   SITE_DOMAIN_NAME / SITE_CERTIFICATE_ARN / SITE_HOSTED_ZONE_ID   optional custom domain
+#
+# No AWS keys are stored in GitHub: credentials are short-lived (OIDC). Runtime
+# secrets (DB passwords, internal token) are generated in and read from AWS
+# Secrets Manager by the workloads themselves; the pipeline only passes their ARNs.
+name: Deploy stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.stage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.smoke.outputs.site_url }}
+    env:
+      STAGE: ${{ inputs.stage }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      GIT_SHA: ${{ github.sha }}
+      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+      SITE_DOMAIN_NAME: ${{ vars.SITE_DOMAIN_NAME }}
+      SITE_CERTIFICATE_ARN: ${{ vars.SITE_CERTIFICATE_ARN }}
+      SITE_HOSTED_ZONE_ID: ${{ vars.SITE_HOSTED_ZONE_ID }}
+      SLS_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Download the frontend build produced by CI
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+
+      - name: Configure AWS credentials (OIDC - no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-${{ inputs.stage }}-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Record current versions (rollback points)
+        id: before
+        run: bash infra/scripts/rollback.sh "$STAGE" capture | tee -a "$GITHUB_OUTPUT"
+
+      - name: Pre-deployment database snapshot
+        if: inputs.stage == 'prod'
+        run: bash infra/scripts/db-snapshot.sh "$STAGE"
+
+      - name: Deploy alerts, network and database
+        run: bash infra/scripts/deploy-stacks.sh "$STAGE" foundation
+
+      - name: Build & push the private GraphQL server image
+        id: image
+        run: bash infra/scripts/build-image.sh | tee -a "$GITHUB_OUTPUT"
+
+      - name: Deploy private GraphQL server (ECS Fargate)
+        id: ecs
+        # CloudFormation waits for a steady state; the ECS circuit breaker /
+        # 5xx alarm roll the service back and fail this step on a bad image.
+        run: IMAGE_URI="${{ steps.image.outputs.image_uri }}" bash infra/scripts/deploy-stacks.sh "$STAGE" ecs
+
+      - name: Deploy frontend infrastructure (S3 + CloudFront)
+        run: bash infra/scripts/deploy-stacks.sh "$STAGE" frontend
+
+      - name: Deploy API (AppSync + Lambda, CodeDeploy traffic shifting)
+        id: api
+        working-directory: services/api
+        # Migrations run as the BeforeAllowTraffic hook; error alarms during the
+        # canary window make CodeDeploy shift traffic back and CloudFormation roll back.
+        run: npx serverless deploy --stage "$STAGE" --region "$AWS_REGION" --conceal
+
+      - name: Run database migrations (idempotent; creates the schema on first deploy)
+        run: bash infra/scripts/migrate.sh "$STAGE"
+
+      - name: Release frontend
+        id: frontend
+        run: bash infra/scripts/deploy-frontend.sh "$STAGE" "$GIT_SHA" frontend-dist
+
+      - name: Deploy monitoring dashboard
+        run: bash infra/scripts/deploy-stacks.sh "$STAGE" monitoring
+
+      - name: Smoke tests
+        id: smoke
+        run: bash infra/scripts/smoke.sh "$STAGE" "$GIT_SHA"
+
+      # ------------------------------------------------------------ rollback
+      # A component whose own deploy step failed was already restored by
+      # CloudFormation / ECS / CodeDeploy. Components that deployed successfully
+      # before a LATER step failed are rolled back here to the recorded versions.
+      - name: Automatic rollback
+        id: rollback
+        if: failure() && steps.before.outcome == 'success'
+        env:
+          PREV_API: ${{ steps.before.outputs.api_timestamp }}
+          PREV_IMAGE: ${{ steps.before.outputs.image_uri }}
+          PREV_RELEASE: ${{ steps.before.outputs.release_id }}
+          FRONTEND_DEPLOYED: ${{ steps.frontend.outcome == 'success' }}
+          API_DEPLOYED: ${{ steps.api.outcome == 'success' }}
+          ECS_DEPLOYED: ${{ steps.ecs.outcome == 'success' }}
+        run: |
+          rolled_back=false
+          if [[ "$FRONTEND_DEPLOYED" == "true" && -n "$PREV_RELEASE" ]]; then
+            bash infra/scripts/rollback.sh "$STAGE" frontend "$PREV_RELEASE"; rolled_back=true
+          fi
+          if [[ "$API_DEPLOYED" == "true" && -n "$PREV_API" ]]; then
+            bash infra/scripts/rollback.sh "$STAGE" api "$PREV_API"; rolled_back=true
+          fi
+          if [[ "$ECS_DEPLOYED" == "true" && -n "$PREV_IMAGE" ]]; then
+            bash infra/scripts/rollback.sh "$STAGE" ecs "$PREV_IMAGE"; rolled_back=true
+          fi
+          echo "rolled_back=$rolled_back" >> "$GITHUB_OUTPUT"
+          {
+            echo "### :rewind: Automatic rollback ($STAGE)"
+            echo "- frontend release → \`${PREV_RELEASE:-n/a}\` (rolled back: $FRONTEND_DEPLOYED)"
+            echo "- API deployment → \`${PREV_API:-n/a}\` (rolled back: $API_DEPLOYED)"
+            echo "- GraphQL server image → \`${PREV_IMAGE:-n/a}\` (rolled back: $ECS_DEPLOYED)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the rolled-back version
+        if: failure() && steps.rollback.outputs.rolled_back == 'true'
+        run: bash infra/scripts/smoke.sh "$STAGE"
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### :rocket: Deployed \`${GIT_SHA:0:12}\` to $STAGE"
+            echo "- Site: ${{ steps.smoke.outputs.site_url }}"
+            echo "- Image: \`${{ steps.image.outputs.image_uri }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

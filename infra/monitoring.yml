@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  gqlapp monitoring - one CloudWatch dashboard across AppSync, Lambda, ECS/ALB
+  and RDS. (Alarms live next to the resources they watch: database.yml,
+  ecs.yml and services/api/serverless.yml.)
+
+Parameters:
+  AppName: { Type: String, Default: gqlapp }
+  Stage: { Type: String, AllowedValues: [staging, prod] }
+  ApiId:
+    Type: String
+    Description: AppSync API id (output GraphQlApiId of the gqlapp-api-<stage> stack)
+
+Resources:
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AppName}-${Stage}'
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              { "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+                "properties": { "markdown": "## ${AppName} ${Stage} — React → AppSync → Lambda → Fargate GraphQL → RDS" } },
+
+              { "type": "metric", "x": 0, "y": 1, "width": 8, "height": 6,
+                "properties": { "title": "AppSync requests & errors", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    ["AWS/AppSync", "4XXError", "GraphQLAPIId", "${ApiId}"],
+                    [".", "5XXError", ".", "."]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 1, "width": 8, "height": 6,
+                "properties": { "title": "AppSync latency (ms)", "region": "${AWS::Region}", "period": 60,
+                  "metrics": [
+                    ["AWS/AppSync", "Latency", "GraphQLAPIId", "${ApiId}", { "stat": "p50" }],
+                    ["...", { "stat": "p95" }]
+                  ] } },
+              { "type": "metric", "x": 16, "y": 1, "width": 8, "height": 6,
+                "properties": { "title": "Real-time subscriptions", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    ["AWS/AppSync", "ActiveConnections", "GraphQLAPIId", "${ApiId}"],
+                    [".", "ActiveSubscriptions", ".", "."],
+                    [".", "PublishDataMessageSuccess", ".", "."]
+                  ] } },
+
+              { "type": "metric", "x": 0, "y": 7, "width": 8, "height": 6,
+                "properties": { "title": "Lambda invocations", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    ["AWS/Lambda", "Invocations", "FunctionName", "${Fn}-query"],
+                    ["...", "${Fn}-mutation"],
+                    ["...", "${Fn}-subscription"]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 7, "width": 8, "height": 6,
+                "properties": { "title": "Lambda errors & throttles", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    ["AWS/Lambda", "Errors", "FunctionName", "${Fn}-query"],
+                    ["...", "${Fn}-mutation"],
+                    ["...", "${Fn}-subscription"],
+                    [".", "Throttles", ".", "${Fn}-query"],
+                    ["...", "${Fn}-mutation"]
+                  ] } },
+              { "type": "metric", "x": 16, "y": 7, "width": 8, "height": 6,
+                "properties": { "title": "Lambda p95 duration (ms) & concurrency", "region": "${AWS::Region}", "period": 60,
+                  "metrics": [
+                    ["AWS/Lambda", "Duration", "FunctionName", "${Fn}-query", { "stat": "p95" }],
+                    ["...", "${Fn}-mutation", { "stat": "p95" }],
+                    [".", "ConcurrentExecutions", ".", "${Fn}-query", { "stat": "Maximum", "yAxis": "right" }]
+                  ] } },
+
+              { "type": "metric", "x": 0, "y": 13, "width": 8, "height": 6,
+                "properties": { "title": "ECS CPU / memory (%)", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                  "metrics": [
+                    ["AWS/ECS", "CPUUtilization", "ClusterName", "${Cluster}", "ServiceName", "${Service}"],
+                    [".", "MemoryUtilization", ".", ".", ".", "."]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 13, "width": 8, "height": 6,
+                "properties": { "title": "ECS running tasks", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                  "metrics": [
+                    ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${Cluster}", "ServiceName", "${Service}"],
+                    [".", "DesiredTaskCount", ".", ".", ".", "."]
+                  ] } },
+              { "type": "metric", "x": 16, "y": 13, "width": 8, "height": 6,
+                "properties": { "title": "Internal ALB", "region": "${AWS::Region}", "period": 60,
+                  "metrics": [
+                    ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb}", { "stat": "Sum" }],
+                    [".", "HTTPCode_Target_5XX_Count", ".", ".", { "stat": "Sum" }],
+                    [".", "TargetResponseTime", ".", ".", { "stat": "p95", "yAxis": "right" }]
+                  ] } },
+
+              { "type": "metric", "x": 0, "y": 19, "width": 8, "height": 6,
+                "properties": { "title": "RDS CPU (%) & connections", "region": "${AWS::Region}", "period": 60,
+                  "metrics": [
+                    ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${Db}", { "stat": "Average" }],
+                    [".", "DatabaseConnections", ".", ".", { "stat": "Maximum", "yAxis": "right" }]
+                  ] } },
+              { "type": "metric", "x": 8, "y": 19, "width": 8, "height": 6,
+                "properties": { "title": "RDS latency (s)", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                  "metrics": [
+                    ["AWS/RDS", "ReadLatency", "DBInstanceIdentifier", "${Db}"],
+                    [".", "WriteLatency", ".", "."]
+                  ] } },
+              { "type": "metric", "x": 16, "y": 19, "width": 8, "height": 6,
+                "properties": { "title": "RDS storage / memory (bytes) & replica lag", "region": "${AWS::Region}", "period": 300,
+                  "metrics": [
+                    ["AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "${Db}", { "stat": "Minimum" }],
+                    [".", "FreeableMemory", ".", ".", { "stat": "Minimum" }],
+                    [".", "ReplicaLag", ".", "${Replica}", { "stat": "Maximum", "yAxis": "right" }]
+                  ] } }
+            ]
+          }
+        - Fn: !Sub '${AppName}-api-${Stage}'
+          Cluster: !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-EcsClusterName' }
+          Service: !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-EcsServiceName' }
+          Alb: !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlbFullName' }
+          Db: !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DbInstanceIdentifier' }
+          Replica: !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DbReadReplicaIdentifier' }
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AppName}-${Stage}'

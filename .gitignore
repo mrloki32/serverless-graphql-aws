@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.serverless/
+.esbuild/
+*.log
+.env
+.env.*
+!.env.example
+frontend/public/config.json
+.DS_Store

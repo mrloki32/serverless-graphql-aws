@@ -1,0 +1,72 @@
+# Manual rollback of one component to a previous version.
+# Run with an empty target first to list the available versions.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        type: choice
+        options: [staging, production]
+        required: true
+      component:
+        description: What to roll back
+        type: choice
+        options: [api, ecs, frontend]
+        required: true
+      target:
+        description: >-
+          api = deployment timestamp, ecs = full image URI, frontend = release id (git SHA).
+          Leave empty to list available versions.
+        type: string
+        required: false
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.component }} (${{ inputs.environment }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+    env:
+      STAGE: ${{ inputs.environment == 'production' && 'prod' || 'staging' }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SITE_DOMAIN_NAME: ${{ vars.SITE_DOMAIN_NAME }}
+      SITE_CERTIFICATE_ARN: ${{ vars.SITE_CERTIFICATE_ARN }}
+      SITE_HOSTED_ZONE_ID: ${{ vars.SITE_HOSTED_ZONE_ID }}
+      SLS_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-rollback-${{ github.run_id }}
+
+      - name: List available versions
+        if: inputs.target == ''
+        run: bash infra/scripts/rollback.sh "$STAGE" list
+
+      - name: Roll back
+        if: inputs.target != ''
+        env:
+          COMPONENT: ${{ inputs.component }}
+          TARGET: ${{ inputs.target }}
+        run: bash infra/scripts/rollback.sh "$STAGE" "$COMPONENT" "$TARGET"
+
+      - name: Smoke tests
+        if: inputs.target != ''
+        run: bash infra/scripts/smoke.sh "$STAGE"

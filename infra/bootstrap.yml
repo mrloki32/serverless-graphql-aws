@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  gqlapp account bootstrap (deploy ONCE per account, by an administrator):
+  GitHub Actions OIDC trust, least-privilege CI/CD role, CloudFormation execution
+  role, Serverless deployment bucket and the ECR repository.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: gqlapp
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  GitHubOrg:
+    Type: String
+    Description: GitHub organisation or user that owns the repository
+  GitHubRepo:
+    Type: String
+    Description: Repository name (without the org)
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Set to false if token.actions.githubusercontent.com already exists in this account
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: Required when CreateOidcProvider=false
+
+Conditions:
+  CreateOidc: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ---------------------------------------------------------------- artifacts
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AppName}-deployments-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  DeploymentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeploymentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt DeploymentBucket.Arn, !Sub '${DeploymentBucket.Arn}/*']
+            Condition: { Bool: { aws:SecureTransport: 'false' } }
+
+  GraphQLServerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AppName}/graphql-server'
+      ImageTagMutability: IMMUTABLE # a tag (git SHA) always means the same image -> safe rollbacks
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 30 images (rollback window)",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},
+            "action":{"type":"expire"}}]}
+
+  # ------------------------------------------------- CloudFormation exec role
+  # Only CloudFormation can assume this role. The CI role can PASS it but holds
+  # none of these permissions itself. IAM changes are limited to roles prefixed
+  # with the app name.
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-cfn-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: scoped-iam
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageAppRolesOnly
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AppName}-*'
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/*'
+
+  # ------------------------------------------------------- GitHub Actions role
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-github-deploy'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateOidc, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Only jobs bound to these GitHub Environments (which carry the
+              # branch protection + required reviewers) can assume the role.
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:environment:staging'
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:environment:production'
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AppStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ContinueUpdateRollback
+                  - cloudformation:CancelUpdateStack
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-*/*'
+              - Sid: CfnReadOnlyGlobal
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListExports
+                Resource: '*'
+              - Sid: PassOnlyTheCfnExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecutionRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: ServerlessArtifacts
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: [!GetAtt DeploymentBucket.Arn, !Sub '${DeploymentBucket.Arn}/*']
+              - Sid: FrontendReleases
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AppName}-*-site-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${AppName}-*-site-${AWS::AccountId}/*'
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !GetAtt GraphQLServerRepository.Arn
+              - Sid: CacheInvalidation
+                Effect: Allow
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/*'
+              - Sid: RunMigrations
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CodeDeployHook_${AppName}-*-migrate'
+              - Sid: ReadLambdaForServerless
+                Effect: Allow
+                Action: [lambda:GetFunction, lambda:GetFunctionConfiguration, lambda:ListVersionsByFunction, lambda:GetAlias]
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-*'
+              - Sid: SmokeTestHealthOnly
+                Effect: Allow
+                Action: appsync:GraphQL
+                Resource: !Sub 'arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/*/types/Query/fields/health'
+              - Sid: PreDeploySnapshots
+                Effect: Allow
+                Action: [rds:CreateDBSnapshot, rds:DescribeDBSnapshots, rds:AddTagsToResource]
+                Resource:
+                  - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${AppName}-*'
+                  - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:snapshot:${AppName}-*'
+              - Sid: DescribeForDiagnostics
+                Effect: Allow
+                Action: [ecs:DescribeServices, ecs:DescribeTasks, rds:DescribeDBInstances]
+                Resource: '*'
+
+Outputs:
+  DeploymentBucketName:
+    Value: !Ref DeploymentBucket
+  CfnExecutionRoleArn:
+    Value: !GetAtt CfnExecutionRole.Arn
+  GitHubDeployRoleArn:
+    Description: Set as the AWS_DEPLOY_ROLE_ARN variable on the GitHub environments
+    Value: !GetAtt GitHubDeployRole.Arn
+  EcrRepositoryUri:
+    Value: !GetAtt GraphQLServerRepository.RepositoryUri

@@ -1,0 +1,100 @@
+# Continuous integration: runs on every pull request and as the first stage of
+# the deployment pipeline (workflow_call from deploy.yml). Needs no AWS access.
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      # Real PostgreSQL (same major version as RDS) for the integration tests:
+      # migrations, SCRAM role provisioning, least-privilege grants, pagination.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dbadmin
+          POSTGRES_PASSWORD: ci-throwaway-password # disposable CI container, not a real credential
+          POSTGRES_DB: appdb
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dbadmin -d appdb"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Unit + integration tests
+        run: npm test
+        env:
+          DATABASE_URL: postgres://dbadmin:ci-throwaway-password@localhost:5432/appdb
+      - name: Build frontend (built once, promoted unchanged to every stage)
+        run: npm run build -w @gqlapp/frontend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 14
+          if-no-files-found: error
+
+  infrastructure:
+    name: Validate infrastructure as code
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cfn-lint
+      - run: npm ci
+      - name: Lint CloudFormation templates
+        run: cfn-lint infra/*.yml
+      - name: Validate Serverless template (offline package + cfn-lint)
+        run: node scripts/validate-serverless.mjs
+      - name: Lint deployment scripts
+        run: shellcheck -x infra/scripts/*.sh
+
+  container:
+    name: Build & scan container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/graphql-server/Dockerfile
+          load: true
+          push: false
+          tags: graphql-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: graphql-server:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'

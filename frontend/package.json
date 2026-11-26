@@ -1,0 +1,26 @@
+{
+  "name": "@gqlapp/frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "React SPA served from S3 + CloudFront; talks to AppSync with Cognito tokens",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "oidc-client-ts": "^3.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-oidc-context": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^7.0.0"
+  }
+}

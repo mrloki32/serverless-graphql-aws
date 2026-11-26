@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+**/coverage
+**/.serverless
+**/.esbuild
+.git
+.github
+docs
+infra
+*.md
+.env
+.env.*

@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  gqlapp database - RDS PostgreSQL in isolated subnets, encrypted, TLS-only,
+  master password managed + rotated by Secrets Manager, least-privilege app
+  credentials, optional read replica and RDS Proxy, CloudWatch alarms.
+
+Parameters:
+  AppName: { Type: String, Default: gqlapp }
+  Stage: { Type: String, AllowedValues: [staging, prod] }
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+  MaxAllocatedStorage:
+    Type: Number
+    Default: 100
+    Description: Storage autoscaling ceiling (GiB)
+  MultiAZ:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  CreateReadReplica:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  EnableRdsProxy:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Connection pooling in front of the primary (recommended for Lambda at scale)
+  DeletionProtection:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+  EnablePerformanceInsights:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  ConnectionsAlarmThreshold:
+    Type: Number
+    Default: 60
+    Description: Alarm when DatabaseConnections exceeds this (size to max_connections of the class)
+
+Conditions:
+  Replica: !Equals [!Ref CreateReadReplica, 'true']
+  Proxy: !Equals [!Ref EnableRdsProxy, 'true']
+  PerfInsights: !Equals [!Ref EnablePerformanceInsights, 'true']
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${AppName}-${Stage} isolated database subnets'
+      SubnetIds:
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSubnet1Id' }
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSubnet2Id' }
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub '${AppName}-${Stage} PostgreSQL 17 parameters'
+      Family: postgres17
+      Parameters:
+        rds.force_ssl: '1' # reject non-TLS connections
+        password_encryption: scram-sha-256
+        log_min_duration_statement: '1000' # log queries slower than 1s
+        idle_in_transaction_session_timeout: '60000'
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${AppName}-${Stage}-postgres'
+      Engine: postgres
+      # Pinned minor; AutoMinorVersionUpgrade applies newer minors in the maintenance window.
+      EngineVersion: '17.11'
+      AutoMinorVersionUpgrade: true
+      DBInstanceClass: !Ref DbInstanceClass
+      MultiAZ: !Ref MultiAZ
+      DBName: appdb
+      MasterUsername: dbadmin
+      ManageMasterUserPassword: true # Secrets Manager generates + rotates it; never in templates/CI
+      StorageType: gp3
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSecurityGroupId' }
+      PubliclyAccessible: false
+      DBParameterGroupName: !Ref DbParameterGroup
+      EnableIAMDatabaseAuthentication: true
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:30-sun:05:30'
+      CopyTagsToSnapshot: true
+      DeletionProtection: !Ref DeletionProtection
+      EnableCloudwatchLogsExports: [postgresql, upgrade]
+      EnablePerformanceInsights: !If [PerfInsights, true, false]
+      PerformanceInsightsRetentionPeriod: !If [PerfInsights, 7, !Ref AWS::NoValue]
+
+  ReadReplica:
+    Type: AWS::RDS::DBInstance
+    Condition: Replica
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AppName}-${Stage}-postgres-replica'
+      SourceDBInstanceIdentifier: !Ref DbInstance
+      DBInstanceClass: !Ref DbInstanceClass
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups:
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSecurityGroupId' }
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage
+      EnablePerformanceInsights: !If [PerfInsights, true, false]
+      PerformanceInsightsRetentionPeriod: !If [PerfInsights, 7, !Ref AWS::NoValue]
+
+  # Least-privilege application credentials. Created here (values generated inside
+  # Secrets Manager); the DB roles themselves are created by the migrate Lambda.
+  AppReadWriteSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AppName}/${Stage}/db/app-rw'
+      Description: DML-only database user for the private GraphQL server (ECS)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"app_rw"}'
+        GenerateStringKey: password
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  AppReadOnlySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AppName}/${Stage}/db/app-ro'
+      Description: SELECT-only database user for the query Lambda
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"app_ro"}'
+        GenerateStringKey: password
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------- RDS Proxy
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Condition: Proxy
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rds.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-app-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref AppReadWriteSecret, !Ref AppReadOnlySecret]
+
+  DbProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: Proxy
+    Properties:
+      DBProxyName: !Sub '${AppName}-${Stage}-proxy'
+      EngineFamily: POSTGRESQL
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      RoleArn: !GetAtt ProxyRole.Arn
+      VpcSubnetIds:
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSubnet1Id' }
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSubnet2Id' }
+      VpcSecurityGroupIds:
+        - !ImportValue { 'Fn::Sub': '${AppName}-${Stage}-DatabaseSecurityGroupId' }
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref AppReadWriteSecret
+          IAMAuth: DISABLED
+          ClientPasswordAuthType: POSTGRES_SCRAM_SHA_256
+        - AuthScheme: SECRETS
+          SecretArn: !Ref AppReadOnlySecret
+          IAMAuth: DISABLED
+          ClientPasswordAuthType: POSTGRES_SCRAM_SHA_256
+
+  DbProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Condition: Proxy
+    Properties:
+      DBProxyName: !Ref DbProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers: [!Ref DbInstance]
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 90
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+
+  # ------------------------------------------------------------------- alarms
+  CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Stage}-rds-cpu-high'
+      AlarmDescription: RDS primary CPU above 80% for 15 minutes (consider scaling the instance class)
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref DbInstance }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+      OKActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+
+  ConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Stage}-rds-connections-high'
+      AlarmDescription: Database connections approaching max_connections (check Lambda concurrency / enable RDS Proxy)
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref DbInstance }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: !Ref ConnectionsAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+      OKActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+
+  FreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Stage}-rds-free-storage-low'
+      AlarmDescription: Less than 2 GiB free storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref DbInstance }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+
+  FreeMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Stage}-rds-freeable-memory-low'
+      AlarmDescription: Less than 64 MiB freeable memory
+      Namespace: AWS/RDS
+      MetricName: FreeableMemory
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref DbInstance }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 67108864
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+
+  WriteLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Stage}-rds-write-latency-high'
+      AlarmDescription: Average write latency above 50 ms
+      Namespace: AWS/RDS
+      MetricName: WriteLatency
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref DbInstance }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.05
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+
+  ReplicaLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: Replica
+    Properties:
+      AlarmName: !Sub '${AppName}-${Stage}-rds-replica-lag-high'
+      AlarmDescription: Read replica more than 30 s behind the primary
+      Namespace: AWS/RDS
+      MetricName: ReplicaLag
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref ReadReplica }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 30
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!ImportValue { 'Fn::Sub': '${AppName}-${Stage}-AlarmTopicArn' }]
+
+Outputs:
+  DbInstanceIdentifier:
+    Value: !Ref DbInstance
+    Export: { Name: !Sub '${AppName}-${Stage}-DbInstanceIdentifier' }
+  InstanceEndpoint:
+    Description: Direct primary endpoint (migrations only)
+    Value: !GetAtt DbInstance.Endpoint.Address
+  WriteEndpoint:
+    Description: Endpoint for read/write application traffic (RDS Proxy when enabled)
+    Value: !If [Proxy, !GetAtt DbProxy.Endpoint, !GetAtt DbInstance.Endpoint.Address]
+    Export: { Name: !Sub '${AppName}-${Stage}-DbWriteEndpoint' }
+  ReadEndpoint:
+    Description: Endpoint for read-only traffic (replica when enabled)
+    Value: !If
+      - Replica
+      - !GetAtt ReadReplica.Endpoint.Address
+      - !If [Proxy, !GetAtt DbProxy.Endpoint, !GetAtt DbInstance.Endpoint.Address]
+  ReadReplicaIdentifier:
+    Value: !If [Replica, !Ref ReadReplica, 'none']
+    Export: { Name: !Sub '${AppName}-${Stage}-DbReadReplicaIdentifier' }
+  Port:
+    Value: !GetAtt DbInstance.Endpoint.Port
+    Export: { Name: !Sub '${AppName}-${Stage}-DbPort' }
+  DatabaseName:
+    Value: appdb
+    Export: { Name: !Sub '${AppName}-${Stage}-DbName' }
+  MasterUserSecretArn:
+    Value: !GetAtt DbInstance.MasterUserSecret.SecretArn
+  AppReadWriteSecretArn:
+    Value: !Ref AppReadWriteSecret
+    Export: { Name: !Sub '${AppName}-${Stage}-DbAppReadWriteSecretArn' }
+  AppReadOnlySecretArn:
+    Value: !Ref AppReadOnlySecret

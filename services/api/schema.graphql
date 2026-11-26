@@ -1,0 +1,91 @@
+# Public GraphQL API (AWS AppSync).
+# Default auth: Cognito User Pools (end users). AWS_IAM is additionally allowed on
+# `health` only, so the CI/CD pipeline can run SigV4-signed smoke tests.
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+enum ChangeAction {
+  CREATED
+  UPDATED
+  DELETED
+}
+
+type Task {
+  id: ID!
+  title: String!
+  description: String
+  status: TaskStatus!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type TaskConnection {
+  items: [Task!]!
+  nextToken: String
+}
+
+type TaskStats {
+  total: Int!
+  todo: Int!
+  inProgress: Int!
+  done: Int!
+}
+
+"Returned by every mutation and pushed to `onTaskChanged` subscribers."
+type TaskChange {
+  action: ChangeAction!
+  owner: ID!
+  task: Task!
+}
+
+type Health @aws_iam @aws_cognito_user_pools {
+  status: String!
+  database: String!
+  graphqlServer: String!
+  version: String!
+}
+
+input CreateTaskInput {
+  title: String!
+  description: String
+  status: TaskStatus
+}
+
+input UpdateTaskInput {
+  id: ID!
+  title: String
+  description: String
+  status: TaskStatus
+}
+
+type Query {
+  "Caller's tasks, newest first. Served by the query Lambda from the RDS read endpoint."
+  tasks(status: TaskStatus, limit: Int, nextToken: String): TaskConnection!
+  task(id: ID!): Task
+  "Aggregates computed by the private GraphQL server on ECS Fargate."
+  taskStats: TaskStats!
+  "End-to-end health: Lambda -> RDS and Lambda -> private GraphQL server."
+  health: Health! @aws_iam @aws_cognito_user_pools
+}
+
+type Mutation {
+  createTask(input: CreateTaskInput!): TaskChange!
+  updateTask(input: UpdateTaskInput!): TaskChange!
+  deleteTask(id: ID!): TaskChange!
+}
+
+type Subscription {
+  "Real-time changes for one owner. A Lambda resolver rejects subscriptions to other users' ids."
+  onTaskChanged(owner: ID!): TaskChange
+    @aws_subscribe(mutations: ["createTask", "updateTask", "deleteTask"])
+}

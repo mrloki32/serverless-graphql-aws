@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: gqlapp alerting - SNS topic for CloudWatch alarms and deployment-failure events
+
+Parameters:
+  AppName: { Type: String, Default: gqlapp }
+  Stage: { Type: String, AllowedValues: [staging, prod] }
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional e-mail subscription (must be confirmed from the inbox)
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AppName}-${Stage}-alarms'
+      DisplayName: !Sub '${AppName} ${Stage} alarms'
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+          - Sid: EventBridgeRules
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Rollbacks are automatic; these make sure humans hear about them.
+  EcsDeploymentFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ECS deployment failed (circuit breaker / alarm rollback triggered)
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Deployment State Change]
+        detail:
+          eventName: [SERVICE_DEPLOYMENT_FAILED]
+      Targets:
+        - Id: sns
+          Arn: !Ref AlarmTopic
+
+  LambdaDeploymentFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CodeDeploy Lambda deployment failed or was rolled back
+      EventPattern:
+        source: [aws.codedeploy]
+        detail-type: [CodeDeploy Deployment State-change Notification]
+        detail:
+          state: [FAILURE, STOP]
+      Targets:
+        - Id: sns
+          Arn: !Ref AlarmTopic
+
+Outputs:
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+    Export: { Name: !Sub '${AppName}-${Stage}-AlarmTopicArn' }
