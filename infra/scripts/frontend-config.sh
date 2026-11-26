@@ -14,7 +14,7 @@ API_STACK="$APP_NAME-api-$STAGE"
 
 export CFG_STAGE="$STAGE"
 export CFG_VERSION="${2:-${GIT_SHA:-local}}"
-export CFG_REGION="${AWS_REGION:-$(aws configure get region)}"
+export CFG_REGION="$AWS_REGION"
 CFG_GRAPHQL_URL=$(require_output "$API_STACK" GraphQlApiUrl)
 CFG_REALTIME_URL=$(require_output "$API_STACK" GraphQlRealtimeUrl)
 CFG_USER_POOL_ID=$(require_output "$API_STACK" UserPoolId)

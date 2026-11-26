@@ -81,5 +81,4 @@ bootstrap, the GitHub environments, and the first pipeline run.
 * **AppSync** is the public GraphQL endpoint because it provides managed WebSocket
   subscriptions. The Lambdas hold the business logic. The Fargate server is a
   private, single-writer domain service.
-* **Region:** the templates are region-agnostic. A CloudFront custom-domain
-  certificate must be in `us-east-1`.
+* **Region:** everything is deployed to `ap-south-1` (Mumbai).

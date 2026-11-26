@@ -22,13 +22,13 @@ const ACCOUNT = '111111111111';
 function placeholder(output) {
   if (/Subnet\d*Id$/.test(output)) return 'subnet-0123456789abcdef0';
   if (/SecurityGroupId$/.test(output)) return 'sg-0123456789abcdef0';
-  if (/Topic/.test(output)) return `arn:aws:sns:us-east-1:${ACCOUNT}:placeholder-alarms`;
+  if (/Topic/.test(output)) return `arn:aws:sns:ap-south-1:${ACCOUNT}:placeholder-alarms`;
   if (/RoleArn$/.test(output)) return `arn:aws:iam::${ACCOUNT}:role/gqlapp-placeholder`;
-  if (/SecretArn$/.test(output)) return `arn:aws:secretsmanager:us-east-1:${ACCOUNT}:secret:gqlapp/placeholder-AbCdEf`;
+  if (/SecretArn$/.test(output)) return `arn:aws:secretsmanager:ap-south-1:${ACCOUNT}:secret:gqlapp/placeholder-AbCdEf`;
   if (/BucketName$/.test(output)) return 'gqlapp-deployments-placeholder';
   if (output === 'SiteUrl') return 'https://d111111abcdef8.cloudfront.net';
-  if (output === 'InternalApiUrl') return 'http://internal-gqlapp-placeholder.us-east-1.elb.amazonaws.com';
-  if (/Endpoint$/.test(output)) return 'gqlapp-placeholder.abcdefghijkl.us-east-1.rds.amazonaws.com';
+  if (output === 'InternalApiUrl') return 'http://internal-gqlapp-placeholder.ap-south-1.elb.amazonaws.com';
+  if (/Endpoint$/.test(output)) return 'gqlapp-placeholder.abcdefghijkl.ap-south-1.rds.amazonaws.com';
   if (output === 'Port') return '5432';
   if (output === 'DatabaseName') return 'appdb';
   throw new Error(`No placeholder for stack output "${output}" - add one to validate-serverless.mjs`);
@@ -49,7 +49,7 @@ let failed = false;
 try {
   for (const stage of stages) {
     console.log(`\n▶ serverless package --stage ${stage}`);
-    execFileSync('npx', ['serverless', 'package', '--config', tmpConfig, '--stage', stage, '--region', 'us-east-1'], {
+    execFileSync('npx', ['serverless', 'package', '--config', tmpConfig, '--stage', stage, '--region', 'ap-south-1'], {
       cwd: apiDir,
       stdio: 'inherit',
       shell: process.platform === 'win32',

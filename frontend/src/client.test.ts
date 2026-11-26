@@ -17,12 +17,12 @@ const task = (id: string, createdAt: string, extra: Partial<Task> = {}): Task =>
 describe('parseConfig', () => {
   const valid = {
     stage: 'staging',
-    region: 'us-east-1',
-    graphqlUrl: 'https://x.appsync-api.us-east-1.amazonaws.com/graphql',
-    realtimeUrl: 'wss://x.appsync-realtime-api.us-east-1.amazonaws.com/graphql',
-    userPoolId: 'us-east-1_abc',
+    region: 'ap-south-1',
+    graphqlUrl: 'https://x.appsync-api.ap-south-1.amazonaws.com/graphql',
+    realtimeUrl: 'wss://x.appsync-realtime-api.ap-south-1.amazonaws.com/graphql',
+    userPoolId: 'ap-south-1_abc',
     userPoolClientId: 'client',
-    cognitoDomain: 'd.auth.us-east-1.amazoncognito.com',
+    cognitoDomain: 'd.auth.ap-south-1.amazoncognito.com',
     version: 'abc123',
   };
   it('accepts a complete config', () => expect(parseConfig(valid)).toEqual(valid));

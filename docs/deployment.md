@@ -6,13 +6,13 @@
 * AWS CLI v2, Node.js 22, Docker, Bash (Git Bash or WSL on Windows)
 * A GitHub repository containing this code
 
-The default region is `us-east-1`. Any region works, but a CloudFront custom-domain
-certificate must always be issued in `us-east-1`.
+Everything deploys to `ap-south-1` (Mumbai). The deployment scripts default to it and
+refuse `us-east-1`.
 
 ## 1. One-time account bootstrap (administrator)
 
 ```bash
-aws cloudformation deploy \
+aws cloudformation deploy --region ap-south-1 \
   --stack-name gqlapp-bootstrap \
   --template-file infra/bootstrap.yml \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -20,7 +20,7 @@ aws cloudformation deploy \
 # If the GitHub OIDC provider already exists in the account, add:
 #   CreateOidcProvider=false ExistingOidcProviderArn=arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com
 
-aws cloudformation describe-stacks --stack-name gqlapp-bootstrap --query "Stacks[0].Outputs" --output table
+aws cloudformation describe-stacks --region ap-south-1 --stack-name gqlapp-bootstrap --query "Stacks[0].Outputs" --output table
 ```
 
 This creates the GitHub OIDC trust, the CI role (`gqlapp-github-deploy`), the
@@ -36,10 +36,16 @@ repository. See [security.md](security.md) for what each one can do.
 
    | Variable | Value |
    |---|---|
-   | `AWS_REGION` | e.g. `us-east-1` |
+   | `AWS_REGION` | `ap-south-1` (optional; this is the default) |
    | `AWS_DEPLOY_ROLE_ARN` | `GitHubDeployRoleArn` output of `gqlapp-bootstrap` |
    | `ALERT_EMAIL` | optional, receives alarms |
-   | `SITE_DOMAIN_NAME`, `SITE_CERTIFICATE_ARN`, `SITE_HOSTED_ZONE_ID` | optional custom domain (certificate in us-east-1) |
+   | `SITE_DOMAIN_NAME`, `SITE_CERTIFICATE_ARN`, `SITE_HOSTED_ZONE_ID` | optional custom domain (see note below) |
+
+   **Custom domain note:** CloudFront is a global service, and AWS only accepts its
+   ACM certificate from the global ACM endpoint (which AWS hosts in N. Virginia). This
+   is an AWS rule that the project can't change. To keep every resource in
+   `ap-south-1`, leave these three variables empty. The site is then served from its
+   `*.cloudfront.net` URL.
 
 3. **Branch protection** on `main`: require the `CI` checks to pass before merging.
 
@@ -63,7 +69,7 @@ The pipeline only calls scripts, so you can run the same steps by hand. You need
 credentials that can assume or pass the CloudFormation execution role:
 
 ```bash
-export AWS_REGION=us-east-1 GIT_SHA=$(git rev-parse HEAD) STAGE=staging
+export AWS_REGION=ap-south-1 GIT_SHA=$(git rev-parse HEAD) STAGE=staging
 npm ci && npm run build -w @gqlapp/frontend
 
 bash infra/scripts/deploy-stacks.sh $STAGE foundation             # alerts, network, database

@@ -1,7 +1,7 @@
 # Deploys one stage end to end, verifies it, and rolls back automatically on failure.
 #
 # Variables (Settings -> Environments -> <env> -> Variables; none are secret):
-#   AWS_REGION            e.g. us-east-1
+#   AWS_REGION            optional, defaults to ap-south-1
 #   AWS_DEPLOY_ROLE_ARN   output GitHubDeployRoleArn of the gqlapp-bootstrap stack
 #   ALERT_EMAIL           optional, subscribed to the alarm topic
 #   SITE_DOMAIN_NAME / SITE_CERTIFICATE_ARN / SITE_HOSTED_ZONE_ID   optional custom domain
@@ -35,7 +35,7 @@ jobs:
       url: ${{ steps.smoke.outputs.site_url }}
     env:
       STAGE: ${{ inputs.stage }}
-      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
       GIT_SHA: ${{ github.sha }}
       ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
       SITE_DOMAIN_NAME: ${{ vars.SITE_DOMAIN_NAME }}
@@ -62,7 +62,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           role-session-name: gha-${{ inputs.stage }}-${{ github.run_id }}
           role-duration-seconds: 3600
 

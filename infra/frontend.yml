@@ -21,7 +21,7 @@ Parameters:
   CertificateArn:
     Type: String
     Default: ''
-    Description: ACM certificate in us-east-1 covering DomainName (required with DomainName)
+    Description: ACM certificate covering DomainName (required with DomainName; CloudFront only accepts certificates from the global ACM endpoint)
   HostedZoneId:
     Type: String
     Default: ''
@@ -29,7 +29,7 @@ Parameters:
   WebAclArn:
     Type: String
     Default: ''
-    Description: Optional AWS WAF web ACL (CLOUDFRONT scope, us-east-1). Off by default for cost.
+    Description: Optional AWS WAF web ACL (CLOUDFRONT scope). Off by default for cost.
 
 Conditions:
   CustomDomain: !And

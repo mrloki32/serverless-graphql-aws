@@ -10,7 +10,7 @@ flowchart LR
     cf["CloudFront<br/>HTTPS · OAC · security headers<br/>cache policies"]
   end
 
-  subgraph region["AWS region (e.g. us-east-1)"]
+  subgraph region["AWS region ap-south-1 (Mumbai)"]
     s3[("S3 site bucket<br/>private · /releases/&lt;git-sha&gt;")]
     cognito["Cognito User Pool<br/>hosted UI · OAuth2 code + PKCE"]
     appsync["AWS AppSync<br/>public GraphQL API<br/>queries · mutations · subscriptions (WSS)"]
@@ -165,7 +165,7 @@ automatic replica scaling becomes a hard requirement, replace `database.yml` wit
 Aurora PostgreSQL Serverless v2. The application needs no changes, because it only
 sees a write endpoint and a read endpoint.
 
-## Cost profile (staging, rough us-east-1 list prices)
+## Cost profile (staging, rough ap-south-1 list prices)
 
 | Item | ≈ USD / month |
 |---|---|

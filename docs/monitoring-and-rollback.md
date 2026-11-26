@@ -93,7 +93,7 @@ Rollback works in layers, from automatic and fine-grained to manual and coarse.
 ### Manual rollback from a shell
 
 ```bash
-export AWS_REGION=us-east-1
+export AWS_REGION=ap-south-1
 bash infra/scripts/rollback.sh prod list                        # versions available
 bash infra/scripts/rollback.sh prod api 1764120000000           # serverless deployment timestamp
 bash infra/scripts/rollback.sh prod ecs <account>.dkr.ecr.<region>.amazonaws.com/gqlapp/graphql-server:<sha>

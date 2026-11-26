@@ -10,6 +10,14 @@ ROOT_DIR="$(cd "$INFRA_DIR/.." && pwd)"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "▶ $*" >&2; }
 
+# Everything in this project runs in ap-south-1 (Mumbai). Export it for the AWS CLI
+# and Serverless so a CLI profile with another default region cannot redirect a deploy.
+export AWS_REGION="${AWS_REGION:-ap-south-1}"
+export AWS_DEFAULT_REGION="$AWS_REGION"
+if [[ "$AWS_REGION" == "us-east-1" ]]; then
+  die "us-east-1 is not allowed; this project deploys to ap-south-1"
+fi
+
 require_stage() {
   case "${1:-}" in
     staging | prod) ;;

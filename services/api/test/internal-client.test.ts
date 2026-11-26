@@ -12,7 +12,7 @@ const fetchMock = vi.fn();
 
 beforeEach(() => {
   process.env.INTERNAL_API_URL = 'http://internal-alb.local';
-  process.env.INTERNAL_API_TOKEN_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:111111111111:secret:token';
+  process.env.INTERNAL_API_TOKEN_SECRET_ARN = 'arn:aws:secretsmanager:ap-south-1:111111111111:secret:token';
   vi.stubGlobal('fetch', fetchMock);
 });
 afterEach(() => {
